@@ -1,0 +1,828 @@
+---
+title: "Linear and Logistic Regression Project"
+author: "Meg Rosales"
+date: "11/12/2019"
+output: html_document
+params:
+ t: !r Sys.time()
+---
+
+##Preliminaries
+```{r}
+#current date and time
+params$t
+```
+
+```{r, echo=F}
+#set working directory
+setwd("C:/Users/meg/Desktop/Fall 2019 Courses/Linear and Logistic Regression")
+
+#load packages
+library(dplyr)
+library(psych)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+library(car)
+library(ResourceSelection)
+library(broom)
+#load dataset
+aaco <- read.csv(file = "Austin_Animal_Center_Outcomes (1).csv")
+```
+
+##Data cleaning
+```{r}
+#got inspiration for data cleaning only from this Kaggle notebook:
+#https://www.kaggle.com/mrisdal/quick-dirty-randomforest
+#see reference in project presentation/paper
+
+#data starts at 109,915 cases
+
+#check unique values in relevant columns
+#Outcome type
+unique(aaco$Outcome.Type)
+
+#simplify analysis to only adoption or euthanasia
+aaco <- aaco%>%
+  filter(Outcome.Type == "Adoption"| Outcome.Type == "Euthanasia")
+#55,396 observations
+table(aaco$Outcome.Type)
+```
+
+```{r}
+#Animal type
+unique(aaco$Animal.Type)
+addmargins(table(aaco$Animal.Type))
+
+#filter to only cats and dogs
+aaco <- aaco%>%
+  filter(Animal.Type == "Cat"| Animal.Type == "Dog")
+addmargins(table(aaco$Animal.Type))
+#50,727 observations
+```
+
+```{r}
+#Sex upon outcome
+addmargins(table(aaco$Sex.upon.Outcome))
+#unknown is missing data, so can't really infer about unknown
+aaco <- aaco%>%
+  filter(Sex.upon.Outcome != "NULL" & Sex.upon.Outcome !="Unknown")
+addmargins(table(aaco$Sex.upon.Outcome))
+#50,393 observations
+
+#split sex upon outcome into spayed/neutered and sex
+aaco$sn <- sapply(as.character(aaco$Sex.upon.Outcome),
+                  function(x)
+                    {unlist(strsplit(x, split = ' '))[1]})
+
+aaco$sex <- sapply(as.character(aaco$Sex.upon.Outcome),
+                  function(x)
+                    {unlist(strsplit(x, split = ' '))[2]})
+
+#generate intact binary variable
+aaco$intact <- ifelse(aaco$sn == "Intact", 1, 0)
+
+#generate female binary variable
+aaco$female <- ifelse(aaco$sex == "Female", 1, 0)
+          
+                    
+```
+
+```{r}
+#Name
+#Create variable has_name
+#choose all non-blank/missing cases
+aaco$has_name <- ifelse(!is.na(as.character(aaco$Name))&as.character(aaco$Name)!="", 1, 0)
+#addmargins(table(aaco$has_name))
+```
+
+Now on to the slightly more complicated cleaning that actually requires some decision making.
+
+```{r}
+#age
+#function that takes the age upon outcome, splits it, and gets the number
+tn <- function(x){
+  l <- unlist(strsplit(x, split = ' '))
+  return(l[1])
+}
+
+#function that takes the age upon outcome, splits it, and gets the unit
+tu <- function(x){
+  l <- unlist(strsplit(x, split = ' '))
+  return(l[2])
+}
+
+#get numerical value of time
+aaco$timenum <- as.numeric(sapply(as.character(aaco$Age.upon.Outcome), tn))
+
+#get unit of time
+aaco$timeunit <- sapply(as.character(aaco$Age.upon.Outcome), tu)
+#get rid of "s" at the end for simplicity
+aaco$timeunit <- gsub('s', '', aaco$timeunit)
+
+#drop rows with missing time numbers
+aaco <- aaco%>%
+  drop_na(timenum)
+
+#50,390 values
+
+#create number of days variable
+aaco$outcomeage <- aaco$timenum
+#unit is days - keep same number
+#change week, month, and year
+#multiply by 7 for week
+aaco$outcomeage[aaco$timeunit == "week"] <- 
+  aaco$outcomeage[aaco$timeunit == "week"]*7
+#by 30 days for month (approximate)
+aaco$outcomeage[aaco$timeunit == "month"] <- 
+  aaco$outcomeage[aaco$timeunit == "month"]*30
+#by 365 for year
+aaco$outcomeage[aaco$timeunit == "year"] <- 
+  aaco$outcomeage[aaco$timeunit == "year"]*365
+```
+
+```{r}
+#color
+length(unique(aaco$Color))
+#415 different colors
+
+color <- aaco%>%
+  group_by(Color)%>%
+  summarize(count = n())%>%
+  mutate(proportion = count/sum(count))%>%
+  arrange(desc(proportion))
+color
+
+#add mixed color binary variable
+aaco$mixedcolor <- ifelse(grepl("/",as.character(aaco$Color)), 1, 0)
+
+#temporary variable
+#take first color as primary color when there is a / present
+#otherwise keep color
+aaco$color2 <- ifelse(grepl('/',as.character(aaco$Color)),
+                      unlist(strsplit(as.character(aaco$Color), '/'))[1],
+                      as.character(aaco$Color))
+
+#some of the colors have two words in them. take the first word
+aaco$color2 <- ifelse(grepl(' ',aaco$color2),
+                      unlist(strsplit(aaco$color2, ' '))[1],
+                      aaco$color2)
+
+#check colors again
+color2 <- aaco%>%
+  group_by(color2)%>%
+  summarize(count = n())%>%
+  mutate(proportion = count/sum(count))%>%
+  arrange(desc(proportion))
+color2
+
+#update colors for mixed cats
+aaco$mixedcolor[aaco$color2 == "Tricolor"|aaco$color2 == "Calico"|
+                  aaco$color2 == "Torbie"] <-1
+
+#consolidate browns: Sable, Chocolate
+aaco$color2[aaco$color2 == "Sable"|aaco$color2 == "Chocolate"|
+              aaco$color2 == "Liver"] <- "Brown"
+
+#consolidate grays: Agouti, Silver
+aaco$color2[aaco$color2 == "Agouti"|aaco$color2 == "Silver"] <- "Gray"
+
+#consolidate tans: cream, fawn
+aaco$color2[aaco$color2 == "Cream"|aaco$color2 == "Fawn"] <- "Tan"
+
+#consolidate orange: apricot
+aaco$color2[aaco$color2 == "Apricot"] <- "Orange"
+
+#consolidate yellow: buff, gold
+aaco$color2[aaco$color2 == "Buff"|aaco$color2 == "Gold"] <- "Yellow"
+
+#multicolor cats can fall under multi
+aaco$color2[aaco$color2 == "Torbie"|aaco$color2 == "Calico"|
+              aaco$color2 == "Tortie"| aaco$color2 == "Tricolor"] <- "Multi"
+
+#acceptably simplified into 10 colors for now
+table(aaco$color2)
+
+#create multinomial variable for color
+#brown will be the reference category
+#brown = 1, blue = 2, black = 3, gray = 4, multi = 5
+#orange = 6, red = 7, tan = 8, white = 9, yellow = 10
+aaco$color_num <- aaco$color2
+aaco$color_num[aaco$color2 == "Brown"] <- 1
+aaco$color_num[aaco$color2 == "Blue"] <- 2
+aaco$color_num[aaco$color2 == "Black"] <- 3
+aaco$color_num[aaco$color2 == "Gray"] <- 4
+aaco$color_num[aaco$color2 == "Multi"] <- 5
+aaco$color_num[aaco$color2 == "Orange"] <- 6
+aaco$color_num[aaco$color2 == "Red"] <- 7
+aaco$color_num[aaco$color2 == "Tan"] <- 8
+aaco$color_num[aaco$color2 == "White"] <- 9
+aaco$color_num[aaco$color2 == "Yellow"] <- 10
+```
+
+```{r}
+#breed
+length(unique(aaco$Breed))
+#1723 breeds
+
+#mixed color indicator
+#mixed if says "Mix" or there's a slash present
+aaco$mixedbreed <- ifelse(grepl('Mix', as.character(aaco$Breed))|
+                  grepl('/', as.character(aaco$Breed)),1, 0)
+
+#examine counts by dog and cat breed
+dogbreed <- aaco%>%
+  filter(Animal.Type == "Dog")%>%
+  group_by(Breed)%>%
+  summarize(count = n())%>%
+  mutate(proportion = count/sum(count))%>%
+  arrange(desc(proportion))
+dogbreed
+
+#play with cumulative proportions to see how many breeds cover all the animals
+sum(head(dogbreed$proportion, n = 40))
+
+head(dogbreed, n = 20)
+
+# #examine graphically
+# ggplot(head(dogbreed, n=20))+
+#   geom_bar(aes(x = reorder(Breed, proportion), y = proportion, fill= Breed), stat = "identity")+
+#   coord_flip()+
+#   theme(legend.position = "none")+
+#   geom_text(aes(x = reorder(Breed, proportion), y = proportion + 0.005, 
+#                 label = round(proportion, 4)),
+#             size = 2)+
+#   xlab("Breed")
+
+#take top 10 dog breeds
+#simplify top 10 so they generalize
+#Pit Bull, Retriever, Chihuahua, Shepherd, Cattle, Dachshund, Collie, Boxer,
+#Terrier, Catahoula, Staffordshire, Husky, Corgi
+#add huskies and corgis because I love them
+
+#first, split any mixes
+#new variable
+aaco$breed2 <- aaco$Breed
+#use only the first breed if split
+aaco$breed2[grepl('/', as.character(aaco$breed2))] <- unlist(strsplit(as.character(aaco$breed2), '/')[1])
+
+#new vector for the multinomialbreed variable
+aaco$breed <- rep(NA, nrow(aaco))
+
+#the 13 dog breeds will be 1 through 13
+aaco$breed[grepl('Pit Bull', as.character(aaco$breed2))] <- 1
+aaco$breed[grepl('Retriever', as.character(aaco$breed2))] <- 2
+aaco$breed[grepl('Chihuahua', as.character(aaco$breed2))] <- 3
+aaco$breed[grepl('Shepherd', as.character(aaco$breed2))] <- 4
+aaco$breed[grepl('Cattle', as.character(aaco$breed2))] <- 5
+aaco$breed[grepl('Dachshund', as.character(aaco$breed2))] <- 6
+aaco$breed[grepl('Collie', as.character(aaco$breed2))] <- 7
+aaco$breed[grepl('Boxer', as.character(aaco$breed2))] <- 8
+aaco$breed[grepl('Terrier', as.character(aaco$breed2))] <- 9
+aaco$breed[grepl('Catahoula', as.character(aaco$breed2))] <- 10
+aaco$breed[grepl('Staffordshire', as.character(aaco$breed2))] <- 11
+aaco$breed[grepl('Husky', as.character(aaco$breed2))] <- 12
+aaco$breed[grepl('Corgi', as.character(aaco$breed2))] <- 13
+
+#go on to cat breeds before simplifying all else to other
+```
+
+```{r}
+#same thing for cats
+catbreed <- aaco%>%
+  filter(Animal.Type == "Cat")%>%
+  group_by(Breed)%>%
+  summarize(count = n())%>%
+  mutate(proportion = count/sum(count))%>%
+  arrange(desc(proportion))
+catbreed
+
+sum(head(catbreed$proportion, n = 5))
+head(catbreed, n = 20)
+#98% of the cats fall in the first 10 categories
+#96% of the cats fall in the first 5 categories
+
+# #examine graphically
+# ggplot(head(catbreed, n= 20))+
+#   geom_bar(aes(x = reorder(Breed, proportion), y = proportion, fill = Breed),
+#            stat = "identity")+
+#   coord_flip()+
+#   geom_text(aes(x = reorder(Breed, proportion), y = proportion + 0.04, 
+#                 label = round(proportion, 4)),
+#             size = 3)+
+#   theme(legend.position = "none")+
+#   xlab("Breed")
+#   
+
+#take top 10 categories and Maine Coon (personal interest)
+#several of the top are mixed, so combine mixes
+#all other cats/dogs become other
+aaco$breed[grepl('Domestic Shorthair', as.character(aaco$breed2))] <- 14
+aaco$breed[grepl('Domestic Medium Hair', as.character(aaco$breed2))] <- 15
+aaco$breed[grepl('Domestic Longhair', as.character(aaco$breed2))] <- 16
+aaco$breed[grepl('Siamese', as.character(aaco$breed2))] <- 17
+aaco$breed[grepl('Snowshoe', as.character(aaco$breed2))] <- 18
+aaco$breed[grepl('American Shorthair', as.character(aaco$breed2))] <- 19
+aaco$breed[grepl('Maine Coon', as.character(aaco$breed2))] <- 20
+#other
+aaco$breed[is.na(aaco$breed)] <- 21
+
+#check breed
+addmargins(table(aaco$breed))
+
+#all breeds accounted for
+```
+
+```{r}
+#date/time of outcome
+#assuming this is date/time of outcome - hopefully the records are correct
+
+#attempted to clean the data with this idea, but it didn't work
+#we have plenty of other variables and data to look at, so I'll just examine the other variables for now
+
+
+# #check day, month, year, and hour
+# aaco$hour <- hour(as.character(aaco$DateTime))
+# aaco$day <- day(as.character(aaco$DateTime))
+# aaco$month <- month(aaco$DateTime)
+# aaco$year <- year(aaco$DateTime)
+```
+
+
+```{r}
+#create final dataset and save so we don't have to keep cleaning every time
+final <- aaco%>%
+  select(c(Outcome.Type, Animal.Type, has_name, outcomeage, intact, female, mixedcolor,color_num, mixedbreed, breed))
+
+#make outcome variable 1-0 binary for adopted (1 = yes, 0 = no)
+final$outcome <- ifelse(final$Outcome.Type == "Adoption", 1, 0)
+
+#make animal type variable 1-0 for cat (1 = yes, 0 = no (dog))
+final$cat <- ifelse(final$Animal.Type == "Cat", 1, 0)
+
+#drop Outcome.Type and Animal.Type variables
+final <- final%>%
+  select(-c(Outcome.Type, Animal.Type))
+
+#save the data in an Rdata file
+save(final, file = "fullanimaldata24Nov19.Rdata")
+```
+
+##Analysis
+
+```{r}
+#load the Rdata file
+load("fullanimaldata24Nov19.Rdata")
+
+#look at dataset structure
+str(final)
+
+#everything is numeric right now, but the only continuous variable is outcome age
+```
+
+###Variable Selection
+
+```{r}
+#check individual logistic regressions for significance
+
+#change color number to a factor
+final$color_num <- as.factor(as.numeric(final$color_num))
+
+#breed is also a factor
+final$breed <- as.factor(final$breed)
+
+#binary variables are already coded, so should give the same results regardless
+#of whether they're factors or not
+
+#change variable order for convenience
+final <- final[c("cat", "has_name", "outcomeage", "intact", "female", "mixedcolor", "color_num", "mixedbreed", "breed", "outcome")]
+
+#check all variables for significance except outcome
+#doing it this way so I can check the significance for each different factor of the breed and color variables
+i = 1
+for(var in final[1:9]){
+  print(colnames(final)[i])
+  model <- glm(outcome ~ var, final,
+               family = binomial(link = "logit"))
+  print(summary(model))
+  i = i + 1
+}
+
+#going to run into the large sample problem here since n = 50,390
+```
+
+Here, we are running into the large sample problem for significance. I'll look at cats and dogs separately first to see if we can identify any trends.
+
+```{r}
+#cat data
+cat <- final%>%
+  filter(cat == 1)
+
+#outcome variable table
+table(cat$outcome)
+
+#need to recode breed because we only have cat breeds, so the reference
+#category no longer holds
+table(cat$breed)
+cat$breed <- as.factor(as.numeric(cat$breed) - 13)
+
+#look at cat colors - we don't have any for color #7, but that's okay
+#because it's a factor
+table(cat$color_num)
+
+#change to factor variable
+cat$color_num <- as.factor(cat$color_num)
+
+#univariable logistic regression for cat
+i = 1
+for(var in cat[1:9]){
+  print(colnames(cat)[i])
+  model <- glm(outcome ~ var, cat,
+               family = binomial(link = "logit"))
+  print(summary(model))
+  i = i + 1
+}
+
+#colors: only color 3 is non-significant at p < 0.25
+#breed: Breeds 2, 4, 7, and 8 are non-significant at p < 0.25. Breed 5 is close at p = 0.27
+
+
+```
+
+##Attempt 1: original coding of breed and color
+#Model 1: All variables present
+```{r}
+#add all the variables into the main model
+cat1 <- glm(outcome ~ has_name + outcomeage + intact + female + mixedcolor +
+              color_num + mixedbreed + breed, cat,
+            family = binomial(link = "logit"))
+summary(cat1)
+#get odds ratios and confidence intervals
+cbind(exp(coef(cat1)), exp(confint(cat1)))
+
+#based on significance at p <0.05, eliminate mixed color
+#should reconsider how breed and color are coded based on these and
+#above results
+
+#for now, continue with the process
+cat2 <- glm(outcome ~ has_name + outcomeage + intact + female +
+              color_num + mixedbreed + breed, cat,
+            family = binomial(link = "logit"))
+summary(cat2)
+cbind(exp(coef(cat2)), exp(confint(cat2)))
+
+#likelihood ratio test for new model
+anova(cat1, cat2, test = "LRT")
+
+#non-significant, new model doesn't fit better
+
+#the model just looks super cumbersome with all those breeds and colors
+#need to simplify further and try again
+```
+
+```{r}
+#look at cat colors
+table(cat$color_num)
+
+#from the univariable logistic regression
+#3, 4, 5, 6, and 9 were significant  (black, gray, multi, orange, white)
+#instead of color num variable, I'll recode into binary for black, orange, white,
+#and brown
+
+cat$black <- ifelse(cat$color_num == "3", 1, 0)
+cat$orange <- ifelse(cat$color_num == "6", 1, 0)
+cat$brown <- ifelse(cat$color_num == "1", 1, 0)
+cat$white <- ifelse(cat$color_num == "9", 1, 0)
+cat$gray <- ifelse(cat$color_num == "4", 1, 0)
+cat$multi <- ifelse(cat$color_num == "5", 1, 0)
+
+#look at cat breeds
+table(cat$breed)
+
+#From univariable logistic regression above: Breeds 2, 4, 7, and 8 are #non-significant at p < 0.25. Breed 5 is close at p = 0.27
+
+#create binary variables for all the rest of the breeds
+cat$domsh <- ifelse(cat$breed == "1", 1, 0)
+cat$domlong <- ifelse(cat$breed == "3", 1, 0)
+cat$snowshoe <- ifelse(cat$breed == "5", 1, 0)
+cat$amsh <- ifelse(cat$breed == "6", 1, 0)
+
+#get rid of the old breed and color variables
+#and cat because we know these are all cats
+cat <- cat%>%
+  select(-c(cat, color_num, breed))
+
+#changed name for outcome variable and then added it to the end to make
+#data easier to work with
+cat$adopted <- cat$outcome
+
+#drop old outcome variable
+cat <- cat%>%
+  select(-c(outcome))
+
+#actually going to save my data this time
+save(cat, file = "catdata24Nov19.Rdata")
+```
+
+At this point, I decided to simplify the project and only analyze the cat
+data.
+
+##Attempt 2: New and improved color and breed variables
+
+#Univariable logistic regressions
+```{r}
+i = 1
+for(var in cat[1:16]){
+  print(colnames(cat)[i])
+  model <- glm(adopted ~ var, cat,
+               family = binomial(link = "logit"))
+  print(summary(model))
+  i = i + 1
+}
+
+```
+
+Only black and brown were non-significant at this point. Add all other variables to the full model.
+
+**Step 1: Full model**
+```{r}
+cat_full <- glm(adopted ~ has_name + outcomeage + intact + female + mixedcolor +
+                  mixedbreed + orange + white + gray + multi + domsh + domlong +
+                  snowshoe + amsh, data = cat,
+                family = binomial(link = "logit"))
+summary(cat_full)
+
+#non-significant variables: mixedcolor, white, gray, multi, domlong, snowsh, amsh
+
+#reduced model
+cat_reduced <- glm(adopted ~ has_name + outcomeage + intact + female + mixedbreed + orange + domsh, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_reduced)
+
+#compare to full model
+anova(cat_reduced, cat_full, test = "Chisq")
+
+#non-significant, reduced model is better
+#however, the coefficient for domestic shorthair changed by 0.2058465
+#so fit another model adding back mixedcolor since that was the closest to
+#nonsignificant last time
+
+cat_reduced2 <- glm(adopted ~ has_name + outcomeage + intact + female + mixedcolor + mixedbreed + orange + domsh, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_reduced2)
+
+#compared to the full model, domsh is only reduced by 16%, which is less than 20%
+#all others are reduced by less that 20% 
+#visually inspected and calculated change for suspicious variables with calculator
+
+#compare new reduced model to the full model
+anova(cat_full, cat_reduced2, test = "Chisq")
+
+#non-significant, so reduced model fits better
+```
+
+#Adding back variables omitted after Step 1 in case they matter in terms of the other variables
+```{r}
+
+#only black and brown were omitted in Step 1 - all other variables were removed
+#in Step 2
+
+#black
+summary(glm(adopted ~ black + has_name + outcomeage + intact + female + mixedcolor + mixedbreed + orange + domsh, data = cat,
+                   family = binomial(link = "logit")))
+
+#brown
+summary(glm(adopted ~ brown + has_name + outcomeage + intact + female + mixedcolor + mixedbreed + orange + domsh, data = cat,
+                   family = binomial(link = "logit")))
+
+#both black and brown are significant after being added back
+#add both back to the model
+cat_step3 <- glm(adopted ~ black + brown + has_name + outcomeage + intact + female + mixedcolor + mixedbreed + orange + domsh, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_step3)
+
+#black remains significant, but brown is not, so only add back black
+
+#preliminary main effects model with ORs and confidence intervals to see if
+#they make sense
+cat_prelim <- glm(adopted ~ black + has_name + outcomeage + intact + female + mixedcolor + mixedbreed + orange + domsh, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_prelim)
+cbind(exp(coef(cat_prelim)),exp(confint(cat_prelim)))
+
+#but neither domestic shorthair nor mixedcolor are significant when black is
+#added back in. remove these two variables
+cat_prelim2 <- glm(adopted ~ black + has_name + outcomeage + intact + female + mixedbreed + orange, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_prelim2)
+cbind(exp(coef(cat_prelim2)),exp(confint(cat_prelim2)))
+
+#compare fit to larger model
+anova(cat_prelim, cat_prelim2, test = "Chisq")
+
+#This is our main effects model
+
+#now check linearity of outcomeage with logit
+cat_lo <- loess(adopted~outcomeage, data = cat)
+#get probabilities
+logit_cat <- logit(predict(cat_lo))
+#linear model of probabilities vs. outcomeage
+cat_lm <- lm(logit_cat~ cat$outcomeage)
+
+#plot probabilities vs. outcomeage
+plot(cat$outcomeage, logit_cat)
+abline(cat_lm)
+title("Plot of Logit vs. Loess")
+
+#that doesn't look very linear. We see a sharp rise and fall in the early days,
+#a rounded drop, and then a sharper decline around about 5750 days
+
+#create some categories
+
+#logit peaks around a fifth of outcome age
+#would make sense if that's about a year, or 365 days
+#make 1 year old kittens the reference category
+#cat$age1 <- ifelse(cat$outcomeage <=365, 1, 0)
+
+#second point looks to be not quite to 1000 days
+#logical point might be 2.5 years, or 913 days
+cat$age1 <- ifelse(cat$outcomeage >365 & cat$outcomeage <= 913, 1,0)
+#a little curvy but near linear to around 5900 days
+cat$age2 <- ifelse(cat$outcomeage > 913 & cat$outcomeage <= 5900, 1, 0)
+#very senior cats
+cat$age3 <- ifelse(cat$outcomeage > 5900, 1, 0)
+
+#check if categories are individually related to outcome when added in
+cat_age1 <- glm(adopted ~ black + has_name + intact + female + mixedbreed + orange + age1, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_age1)
+
+cat_age2 <- glm(adopted ~ black + has_name + intact + female + mixedbreed + orange + age2, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_age2)
+
+cat_age3 <- glm(adopted ~ black + has_name + intact + female + mixedbreed + orange + age3, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_age3)
+
+#all were significant individually
+
+#add all categories to the model
+cat_main <- glm(adopted ~ black + has_name + intact + female + mixedbreed + orange + age1 + age2 + age3, data = cat,family = "binomial"(link = "logit"))
+summary(cat_main)
+                   
+#all three categories were significant, but the odds ratios were quite
+#different, so this parametrization seems helpful. When age categories are taken
+#into account, orange is no longer significant, so try again
+cat_main2 <- glm(adopted ~ black + has_name + intact + female + mixedbreed +  age1 + age2 + age3, data = cat,
+                   family = binomial(link = "logit"))
+summary(cat_main2)
+cbind(exp(coef(cat_main2)),exp(confint(cat_main2)))
+
+#compare model with and without orange
+anova(cat_main, cat_main2, test = "Chisq")
+
+#just barely non-significant, so the model without orange is a slightly better fit
+
+#this is our solidified main effects model
+```
+
+#Interactions
+```{r}
+#see if any interactions are significant`
+names <- c("black", "has_name", "intact","female","mixedbreed", "age1", "age2", "age3")
+
+#initalize lists for names, coefficients, and p-values
+nia <- NULL
+coia <- NULL
+pia <- NULL
+
+#example to check format
+ia <- glm(formula = adopted ~ black + has_name + intact + female + mixedbreed + age1 + age2 + age3 + black:intact,
+    family = binomial(link = "logit"), data = cat)
+summary(ia)
+#values are on the 10th row of the coefficients
+
+#initialize list indices
+k = 1
+
+#interaction models
+for(i in 1:length(names)){
+  j = i+1
+  while(j <= length(names)){
+    var1 <- names[i]
+    var2 <- names[j]
+    call<-paste("glm(adopted~black+has_name+intact+female+mixedbreed+age1+age2+age3+",
+                var1,":",var2,
+                ",data=cat,family=binomial(link=logit))",sep="")
+    ig <- eval(parse(text = call))
+    igs <- summary(ig)
+    if(!(var1%in%c("age1", "age2","age3") & (var2%in%c("age1", "age2","age3")))){
+      nia[k] <- paste(var1, ":", var2)
+      coia[k] <- coef(igs)[10,1]
+     pia[k] <- coef(igs)[10,4]
+    }
+    
+    # nia[k] <- paste(var1, ":", var2)
+    # coia[k] <- coef(igs)[10,1]
+    # pia[k] <- coef(igs)[10,4]
+    
+    j = j + 1
+    k = k + 1
+  }
+}
+
+ia_data <- as.data.frame(cbind(nia, coia, pia))
+ia_data
+
+#list of significant interactions
+#has_name:intact, has_name:mixedbreed, has_name:age2, intact:mixedbreed, intact:age1, intact:age2, mixedbreed:age2
+```
+
+
+```{r}
+#add interactions to the model
+interactions <- glm(formula = adopted ~ black + has_name + intact + female + mixedbreed + age1 + age2 + age3 + black:mixedbreed + has_name:intact + has_name:mixedbreed + has_name:age2 + intact:mixedbreed + intact:age1 + intact:age2,
+    family = binomial(link = "logit"), data = cat)
+summary(interactions)
+
+#can drop black:mixedbreed, intact:mixedbreed, intact:age1, intact:age2
+
+#drop non-significant interactions
+interactions2 <- glm(formula = adopted ~ black + has_name + intact + female + mixedbreed + age1 + age2 + age3 + has_name:intact + has_name:mixedbreed + has_name:age2,
+    family = binomial(link = "logit"), data = cat)
+summary(interactions2)
+#ORs and confidence intervals
+cbind(exp(coef(interactions2)),exp(confint(interactions2)))
+```
+
+```{r}
+#intact:mixedbreed was closest to significant, so add it back
+interactions3 <- glm(formula = adopted ~ black + has_name + intact + female + mixedbreed + age1 + age2 + age3 + has_name:intact + has_name:mixedbreed + has_name:age2 + intact:mixedbreed,
+    family = binomial(link = "logit"), data = cat)
+summary(interactions3)
+
+#See if this model fits better
+anova(interactions2, interactions3, test = "Chisq")
+
+#Fits better with intact:mixed breed added
+#Does it fit better than the full interaction model?
+anova(interactions, interactions3, test = "Chisq")
+
+#Yes. Finally, the final model
+#get odds ratios and confidence intervals
+cbind(exp(coef(interactions3)),exp(confint(interactions3)))
+```
+
+
+##Model goodness of fit
+```{r}
+#Check goodness of fit with Hosmer-Lemeshow Goodness of Fit test
+hoslem.test(cat$adopted, fitted(interactions3), g = 10)
+
+#fit is quite poor...revisit this after diagnostics
+```
+
+##Assumptions
+
+```{r}
+
+#Outcome is binary: adopted = 1, not adopted/euthanized = 0
+
+#Already checked for linearity of outcomeage with the logit of adopted. All other predictor variables are #categorical. 
+
+#Check for multicollinearity within the main model - obviously there will be a relationship between
+#the variables with interaction terms, so use main model
+vif(cat_main2)
+
+#Nothing over 5, so we're good
+
+#Check for influential values in continuous variable outcomeage
+#anything with a Cook's distance larger than 4/n is suspect
+#add Cook's distance to dataframe
+cat$cooks <- cooks.distance(interactions3)
+
+#look at the outliers
+high_lev <- cat%>%
+  filter(cooks > 4/nrow(cat))
+high_lev
+
+#624 rows - yikes. Let's try getting rid of the outliers?
+no_ol <- cat%>%
+  filter(cooks < 4/nrow(cat))
+
+#try final model again without outliers
+final_no_ol <- glm(formula = adopted ~ black + has_name + intact + female + mixedbreed + age1 + age2 + age3 + has_name:intact + has_name:mixedbreed + has_name:age2 + intact:mixedbreed,
+    family = binomial(link = "logit"), data = no_ol)
+summary(final_no_ol)
+
+#this fails because getting rid of the outliers seems to have introduced complete separation
+#somewhere in the model
+
+#ORs and confidence intervals
+cbind(exp(coef(final_no_ol)),exp(confint(final_no_ol)))
+
+#goodness of fit - would have done this if getting rid of the outliers had worked
+#hoslem.test(cat$adopted, fitted(final_no_ol), g = 10)
+```
+
